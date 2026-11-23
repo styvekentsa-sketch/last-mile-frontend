@@ -17,8 +17,8 @@ import {
   WalletCards,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useParams, useSearchParams } from 'react-router-dom'
 import LanguageSwitcher from '../components/settings/LanguageSwitcher.jsx'
 import ThemeToggle from '../components/settings/ThemeToggle.jsx'
 import UserAvatar from '../components/profile/UserAvatar.jsx'
@@ -28,6 +28,7 @@ import { getApiErrorMessage } from '../services/api.js'
 import publicShopService from '../services/publicShopService.js'
 import { createPaymentSocket } from '../services/paymentSocket.js'
 import { resolveAvatarUrl } from '../utils/avatar.js'
+import { removeShopFromStoredCart } from '../marketplace/cart/cartStorage.js'
 
 const DISTRICTS = ['Akwa', 'Bonamoussadi', 'Ndogbong', 'Bonapriso', 'Deido']
 const INITIAL_CHECKOUT = {
@@ -278,12 +279,39 @@ function SuccessSheet({ checkoutResult, district, language, onClose, t }) {
   )
 }
 
+const MAX_PREFILL_LINES = 50
+
+/** Articles transmis par le portail : ?panier=12:2,15:1 ou ?produit=12&quantite=2. */
+function readPrefill(searchParams) {
+  const toLine = (id, quantity) => {
+    const productId = Number(id)
+    const parsedQuantity = Number.parseInt(quantity, 10)
+    return Number.isSafeInteger(productId) && productId > 0
+      ? { productId, quantity: Number.isFinite(parsedQuantity) && parsedQuantity > 0 ? Math.min(parsedQuantity, 99) : 1 }
+      : null
+  }
+  const basket = searchParams.get('panier')
+  if (basket) {
+    return basket.split(',').slice(0, MAX_PREFILL_LINES).map((entry) => toLine(...entry.split(':'))).filter(Boolean)
+  }
+  const single = toLine(searchParams.get('produit'), searchParams.get('quantite'))
+  return single ? [single] : []
+}
+
 export default function PublicShop({ installControl }) {
   const { slug } = useParams()
   const { language, t } = useLanguage()
   const [catalog, setCatalog] = useState(null)
   const [cart, setCart] = useState({})
-  const [checkout, setCheckout] = useState(INITIAL_CHECKOUT)
+  // Quartier par defaut choisi dans les preferences de la marketplace (s'il est desservi)
+  const [checkout, setCheckout] = useState(() => {
+    try {
+      const zone = JSON.parse(window.localStorage.getItem('last-mile-marketplace-zone') || '""')
+      return DISTRICTS.includes(zone) ? { ...INITIAL_CHECKOUT, district: zone } : INITIAL_CHECKOUT
+    } catch {
+      return INITIAL_CHECKOUT
+    }
+  })
   const [checkoutResult, setCheckoutResult] = useState(null)
   const [pendingPayment, setPendingPayment] = useState(null)
   const [countdown, setCountdown] = useState(30)
@@ -292,6 +320,46 @@ export default function PublicShop({ installControl }) {
   const [isCheckingOut, setIsCheckingOut] = useState(false)
   const [loadError, setLoadError] = useState('')
   const [checkoutError, setCheckoutError] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
+  // Arrivee depuis le portail : fiche produit (?produit=ID&quantite=N) ou panier (?panier=ID:N,ID:N).
+  // Lu une seule fois : les articles sont places dans le panier et le paiement s'ouvre.
+  const prefillRef = useRef(readPrefill(searchParams))
+
+  const applyPrefill = useCallback((shopCatalog) => {
+    const lines = prefillRef.current
+    if (!lines.length) {
+      return
+    }
+    prefillRef.current = []
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current)
+      next.delete('produit')
+      next.delete('quantite')
+      next.delete('panier')
+      return next
+    }, { replace: true })
+
+    // Seuls les produits reellement en stock dans cette boutique sont retenus (quantite plafonnee au stock)
+    const prefilledCart = {}
+    lines.forEach(({ productId, quantity }) => {
+      const product = shopCatalog?.products?.find((item) => Number(item.id) === productId)
+      if (product && Number(product.stock) > 0) {
+        prefilledCart[product.id] = Math.max(1, Math.min(Number(product.stock), quantity))
+      }
+    })
+    if (!Object.keys(prefilledCart).length) {
+      return
+    }
+    setCart(prefilledCart)
+    setIsCheckoutOpen(true)
+  }, [setSearchParams])
+
+  // Commande payee : les articles de cette boutique sont retires du panier du portail
+  useEffect(() => {
+    if (checkoutResult?.payment_status === 'paid') {
+      removeShopFromStoredCart(slug)
+    }
+  }, [checkoutResult, slug])
 
   const loadCatalog = useCallback(async ({ silent = false } = {}) => {
     if (!silent) {
@@ -300,7 +368,9 @@ export default function PublicShop({ installControl }) {
     setLoadError('')
 
     try {
-      setCatalog(await publicShopService.getShop(slug))
+      const shopCatalog = await publicShopService.getShop(slug)
+      setCatalog(shopCatalog)
+      applyPrefill(shopCatalog)
     } catch (error) {
       setLoadError(getApiErrorMessage(error, t('socialHub.unavailable')))
     } finally {
@@ -308,7 +378,7 @@ export default function PublicShop({ installControl }) {
         setIsLoading(false)
       }
     }
-  }, [slug, t])
+  }, [slug, t, applyPrefill])
 
   const refreshCatalogSilently = useCallback(() => loadCatalog({ silent: true }), [loadCatalog])
   useAutoRefresh(refreshCatalogSilently, ['products'])
